@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Runtime / local state (never commit secrets)
+/.ssh-connector-data/
+/.playwright-cli/
+*.db
+*.db-*
+/token
+/audit/
+
+# Test credentials — pure test machines but keep out of VCS hygiene-wise
+主机.key
+
+# OS
+.DS_Store

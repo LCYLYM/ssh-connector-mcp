@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSH 连接器</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+</head>
+<body>
+
+  <!-- LOCK SCREEN -->
+  <div id="lock-screen" class="lock-screen hidden" role="main" aria-label="凭据库访问">
+    <div class="lock-card">
+      <h1 class="lock-title">SSH 连接器</h1>
+      <p id="lock-subtitle" class="lock-subtitle"></p>
+      <form id="lock-form" novalidate>
+        <div class="field-group">
+          <label for="mp-input">主密码</label>
+          <input id="mp-input" type="password" autocomplete="current-password"
+            placeholder="输入主密码" required />
+        </div>
+        <div id="mp-confirm-wrap" class="field-group hidden">
+          <label for="mp-confirm">确认主密码</label>
+          <input id="mp-confirm" type="password" autocomplete="new-password"
+            placeholder="再次输入主密码" />
+        </div>
+        <div id="lock-error" class="inline-error hidden" role="alert" aria-live="assertive"></div>
+        <button id="lock-submit" type="submit" class="btn btn-primary btn-full">解锁</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- MAIN APP SHELL -->
+  <div id="app" class="app hidden">
+    <nav id="sidebar" class="sidebar" aria-label="主导航">
+      <div class="sidebar-brand">
+        <span class="brand-kicker">AI-safe SSH MCP</span>
+        <span class="brand-name">SSH 连接器</span>
+        <span class="brand-subtitle">本地加密凭据库 · 远端运维工具面</span>
+      </div>
+      <ul class="nav-list" role="list">
+        <li><button class="nav-item active" data-view="hosts" aria-current="page">&#9638; 主机</button></li>
+        <li><button class="nav-item" data-view="sessions">&#9654; 会话</button></li>
+        <li><button class="nav-item" data-view="audit">&#8801; 审计日志</button></li>
+      </ul>
+      <div class="sidebar-panel" aria-label="安全边界">
+        <span class="panel-label">安全边界</span>
+        <span>凭据只写入加密 vault</span>
+        <span>AI 侧仅引用 host_id</span>
+        <span>HTTP/MCP 仅监听 127.0.0.1</span>
+      </div>
+      <div class="sidebar-footer">
+        <button id="lock-btn" class="btn btn-ghost btn-sm">锁定凭据库</button>
+      </div>
+    </nav>
+    <main id="content" class="content">
+      <!-- HOSTS VIEW -->
+      <section id="view-hosts" class="view" aria-label="主机">
+        <header class="view-header">
+          <div class="view-title-group">
+            <span class="view-kicker">Hosts</span>
+            <h2>主机</h2>
+            <p>用人类管理凭据，用 AI 执行真实 SSH、PTY 和 SFTP 工作流。</p>
+          </div>
+          <button id="add-host-btn" class="btn btn-primary btn-sm">+ 添加主机</button>
+        </header>
+        <div class="summary-strip" aria-label="能力摘要">
+          <div><strong>短命令</strong><span>exec argv 自动转义</span></div>
+          <div><strong>长会话</strong><span>PTY 会话可接管和关闭</span></div>
+          <div><strong>文件</strong><span>SFTP 文本传输</span></div>
+          <div><strong>审计</strong><span>操作流水本地记录</span></div>
+        </div>
+        <div id="hosts-status" class="status-bar hidden" role="status" aria-live="polite"></div>
+        <div id="hosts-loading" class="loading-state">加载中&hellip;</div>
+        <div id="hosts-empty" class="empty-state hidden">还没有配置主机。</div>
+        <div id="hosts-table-wrap" class="hidden">
+          <table class="data-table" aria-label="SSH 主机">
+            <thead><tr>
+              <th scope="col">别名</th><th scope="col">主机</th><th scope="col">端口</th>
+              <th scope="col">用户</th><th scope="col">认证</th><th scope="col">跳板</th>
+              <th scope="col">状态</th><th scope="col" class="col-actions">操作</th>
+            </tr></thead>
+            <tbody id="hosts-body"></tbody>
+          </table>
+        </div>
+      </section>
+      <!-- SESSIONS VIEW -->
+      <section id="view-sessions" class="view hidden" aria-label="活动会话">
+        <header class="view-header">
+          <div class="view-title-group">
+            <span class="view-kicker">Sessions</span>
+            <h2>会话</h2>
+            <p>查看和接管 AI 打开的交互式远端终端。</p>
+          </div>
+          <button id="sessions-refresh" class="btn btn-ghost btn-sm">&#8635; 刷新</button>
+        </header>
+        <div id="sessions-status" class="status-bar hidden" role="status" aria-live="polite"></div>
+        <div id="sessions-loading" class="loading-state hidden">加载中&hellip;</div>
+        <div id="sessions-empty" class="empty-state hidden">没有活动会话。</div>
+        <div id="sessions-table-wrap" class="hidden">
+          <table class="data-table" aria-label="活动终端会话">
+            <thead><tr>
+              <th scope="col">会话 ID</th><th scope="col">主机</th><th scope="col">类型</th>
+              <th scope="col">开始时间</th><th scope="col">剩余时间</th><th scope="col">尺寸</th>
+              <th scope="col" class="col-actions">操作</th>
+            </tr></thead>
+            <tbody id="sessions-body"></tbody>
+          </table>
+        </div>
+        <div id="terminal-panel" class="terminal-panel hidden" aria-label="终端接管">
+          <div class="terminal-header">
+            <span id="terminal-label" class="terminal-label"></span>
+            <button id="terminal-close" class="btn btn-ghost btn-sm">&#10005; 关闭</button>
+          </div>
+          <div id="xterm-container" class="xterm-container" aria-label="交互式终端"></div>
+        </div>
+      </section>
+      <!-- AUDIT VIEW -->
+      <section id="view-audit" class="view hidden" aria-label="审计日志">
+        <header class="view-header">
+          <div class="view-title-group">
+            <span class="view-kicker">Audit</span>
+            <h2>审计日志</h2>
+            <p>跟踪 vault、主机、命令、终端和文件传输操作。</p>
+          </div>
+          <button id="audit-refresh" class="btn btn-ghost btn-sm">&#8635; 刷新</button>
+        </header>
+        <div id="audit-status" class="status-bar hidden" role="status" aria-live="polite"></div>
+        <div id="audit-loading" class="loading-state hidden">加载中&hellip;</div>
+        <div id="audit-empty" class="empty-state hidden">没有审计记录。</div>
+        <div id="audit-list" class="audit-list hidden"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- TOAST REGION -->
+  <div id="toast-region" class="toast-region" aria-live="assertive" aria-atomic="true"></div>
+
+  <!-- HOST MODAL -->
+  <div id="host-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="host-modal-title">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="host-modal-title">添加主机</h3>
+        <button class="modal-close" id="host-modal-close" aria-label="关闭对话框">&times;</button>
+      </div>
+      <form id="host-form" class="modal-body" novalidate>
+        <input type="hidden" id="host-id-field" value="" />
+        <div class="form-grid">
+          <div class="field-group">
+            <label for="hf-alias">别名 <span class="required" aria-hidden="true">*</span></label>
+            <input id="hf-alias" type="text" placeholder="例如 prod-web-01" required />
+          </div>
+          <div class="field-group">
+            <label for="hf-host">主机名 / IP <span class="required" aria-hidden="true">*</span></label>
+            <input id="hf-host" type="text" placeholder="例如 192.168.1.10" required />
+          </div>
+          <div class="field-group">
+            <label for="hf-port">端口</label>
+            <input id="hf-port" type="number" min="1" max="65535" value="22" />
+          </div>
+          <div class="field-group">
+            <label for="hf-user">用户名 <span class="required" aria-hidden="true">*</span></label>
+            <input id="hf-user" type="text" placeholder="例如 ubuntu" required />
+          </div>
+        </div>
+        <fieldset class="field-group">
+          <legend>认证方式</legend>
+          <div class="radio-group">
+            <label><input type="radio" name="auth-type" value="password" checked /> 密码</label>
+            <label><input type="radio" name="auth-type" value="private_key" /> 私钥</label>
+            <label><input type="radio" name="auth-type" value="keyboard_interactive" /> 键盘交互</label>
+          </div>
+          <div id="auth-password-fields">
+            <div class="field-group">
+              <label for="hf-password">密码</label>
+              <input id="hf-password" type="password" autocomplete="new-password" placeholder="SSH 密码" />
+            </div>
+          </div>
+          <div id="auth-key-fields" class="hidden">
+            <div class="field-group">
+              <label for="hf-key-pem">私钥（PEM）</label>
+              <textarea id="hf-key-pem" rows="5" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."></textarea>
+            </div>
+            <div class="field-group">
+              <label for="hf-key-passphrase">私钥口令（可选）</label>
+              <input id="hf-key-passphrase" type="password" autocomplete="new-password" placeholder="没有则留空" />
+            </div>
+          </div>
+          <div id="auth-ki-fields" class="hidden">
+            <div class="field-group">
+              <label for="hf-ki-answers">应答（一行一个）</label>
+              <textarea id="hf-ki-answers" rows="3" placeholder="应答 1&#10;应答 2"></textarea>
+            </div>
+          </div>
+        </fieldset>
+        <fieldset class="field-group" id="jump-hosts-section">
+          <legend>跳板主机 <span class="hint">（可选）</span></legend>
+          <div id="jump-hosts-list"></div>
+          <button type="button" id="add-jump-btn" class="btn btn-ghost btn-sm">+ 添加跳板</button>
+        </fieldset>
+        <fieldset class="field-group" id="env-vars-section">
+          <legend>环境变量 <span class="hint">（可选）</span></legend>
+          <div id="env-vars-list"></div>
+          <button type="button" id="add-env-btn" class="btn btn-ghost btn-sm">+ 添加变量</button>
+        </fieldset>
+        <div id="host-form-error" class="inline-error hidden" role="alert" aria-live="assertive"></div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" id="host-modal-cancel">取消</button>
+          <button type="submit" class="btn btn-primary" id="host-form-submit">保存主机</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- REVEAL MODAL -->
+  <div id="reveal-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="reveal-modal-title">
+    <div class="modal modal-sm">
+      <div class="modal-header">
+        <h3 id="reveal-modal-title">查看凭据</h3>
+        <button class="modal-close" id="reveal-modal-close" aria-label="关闭对话框">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="reveal-warning">此操作会显示明文凭据。请重新输入主密码继续。</p>
+        <div class="field-group">
+          <label for="reveal-mp">主密码</label>
+          <input id="reveal-mp" type="password" autocomplete="current-password" placeholder="主密码" />
+        </div>
+        <div id="reveal-error" class="inline-error hidden" role="alert" aria-live="assertive"></div>
+        <div id="reveal-result" class="reveal-result hidden" aria-live="polite">
+          <pre id="reveal-content" class="reveal-pre"></pre>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" id="reveal-cancel">取消</button>
+          <button type="button" class="btn btn-primary" id="reveal-submit">查看</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
