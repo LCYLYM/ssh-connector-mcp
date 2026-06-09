@@ -1,5 +1,7 @@
 # SSH Connector MCP
 
+> **中文文档:** [README.zh-CN.md](README.zh-CN.md)
+
 **The AI-safe SSH bridge for Codex, Claude Code, OpenClaw, and any MCP client.**
 
 SSH Connector MCP gives AI agents a production-grade way to operate real Linux servers without ever reading your stored SSH passwords or private keys. Humans manage hosts in a local Web UI; agents receive a small MCP tool surface for `exec`, persistent PTY sessions, and SFTP file transfer.
