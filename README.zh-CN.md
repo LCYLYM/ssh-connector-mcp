@@ -196,6 +196,72 @@ Network: 127.0.0.1 only
 | `session_resize`, `session_close`, `session_list` | 管理 live PTY 会话。 |
 | `sftp_list`, `sftp_get`, `sftp_put` | 通过 SFTP 传输文本文件。 |
 
+## 主机凭据参数结构
+
+`host_add` 和 `host_update` 使用同一套主机参数。必填字段是 `alias`、
+`host`、`user`、`auth`；可选字段是 `port`、`jump_hosts`、`env`。
+
+密码认证：
+
+```json
+{
+  "alias": "prod-box",
+  "host": "203.0.113.10",
+  "port": 22,
+  "user": "root",
+  "auth": { "type": "password", "password": "..." }
+}
+```
+
+私钥认证：
+
+```json
+{
+  "alias": "key-box",
+  "host": "203.0.113.11",
+  "user": "ubuntu",
+  "auth": {
+    "type": "private_key",
+    "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
+    "passphrase": "optional"
+  }
+}
+```
+
+键盘交互认证：
+
+```json
+{
+  "alias": "mfa-box",
+  "host": "203.0.113.12",
+  "user": "admin",
+  "auth": {
+    "type": "keyboard_interactive",
+    "answers": ["password-or-first-answer", "otp-or-second-answer"]
+  }
+}
+```
+
+跳板机链路里每一跳也使用同样的 `auth` 对象：
+
+```json
+{
+  "alias": "internal-box",
+  "host": "10.0.0.20",
+  "user": "root",
+  "auth": { "type": "password", "password": "..." },
+  "jump_hosts": [
+    {
+      "host": "203.0.113.100",
+      "port": 22,
+      "user": "bastion",
+      "auth": { "type": "private_key", "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\n..." }
+    }
+  ],
+  "env": { "TERM": "xterm-256color" }
+}
+```
+
 ## Exec Payload
 
 优先使用 `argv`：

@@ -8,18 +8,25 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthMethod {
+    /// Password authentication. Input shape: {"type":"password","password":"..."}.
     Password {
+        /// SSH account password. Stored encrypted and never returned by MCP tools.
         password: String,
     },
-    /// PEM/OpenSSH private key material plus optional passphrase.
+    /// Private-key authentication. Input shape:
+    /// {"type":"private_key","key_pem":"-----BEGIN OPENSSH PRIVATE KEY-----\n...","passphrase":"optional"}.
     PrivateKey {
+        /// PEM/OpenSSH private key text, including BEGIN/END lines.
         key_pem: String,
+        /// Optional passphrase for an encrypted private key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         passphrase: Option<String>,
     },
     /// Server-driven keyboard-interactive; answers are tried in order against
-    /// successive prompts. Useful for simple OTP/2FA flows.
+    /// successive prompts. Input shape:
+    /// {"type":"keyboard_interactive","answers":["password","otp-or-other-answer"]}.
     KeyboardInteractive {
+        /// Ordered answers to keyboard-interactive prompts.
         answers: Vec<String>,
     },
 }
@@ -53,10 +60,14 @@ impl AuthMethod {
 /// One hop in a jump chain. Each hop authenticates independently.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct JumpHop {
+    /// Jump/bastion hostname or IP address.
     pub host: String,
+    /// SSH port for this jump hop. Defaults to 22 when omitted.
     #[serde(default = "default_port")]
     pub port: u16,
+    /// SSH login user for this jump hop.
     pub user: String,
+    /// Credential object for this jump hop. Uses the same auth shapes as the final host.
     pub auth: AuthMethod,
 }
 
@@ -97,14 +108,25 @@ impl HostConfig {
 /// Input shape for creating/updating a host (no server-assigned id).
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct HostSpec {
+    /// Human-readable host name shown in the UI and host_list output.
     pub alias: String,
+    /// Target hostname or IP address.
     pub host: String,
+    /// Target SSH port. Defaults to 22 when omitted.
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Target SSH login user.
     pub user: String,
+    /// Target credential object. Choose exactly one tagged shape:
+    /// {"type":"password","password":"..."},
+    /// {"type":"private_key","key_pem":"-----BEGIN OPENSSH PRIVATE KEY-----\n...","passphrase":"optional"},
+    /// or {"type":"keyboard_interactive","answers":["answer1","answer2"]}.
     pub auth: AuthMethod,
+    /// Optional ordered bastion chain. Each item is {host, port, user, auth};
+    /// each hop has its own independent auth object.
     #[serde(default)]
     pub jump_hosts: Vec<JumpHop>,
+    /// Optional string environment variables applied to interactive sessions.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
 }

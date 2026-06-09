@@ -184,7 +184,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Create a new host. Accepts credentials (password/private_key/keyboard_interactive) and optional jump hops; secrets are stored encrypted and are write-only to AI. Returns the new host_id."
+        description = "Create a new SSH host and encrypted credential entry. Required fields: alias, host, user, auth. Optional fields: port (default 22), jump_hosts, env. Auth is a tagged object: password = {\"type\":\"password\",\"password\":\"...\"}; private_key = {\"type\":\"private_key\",\"key_pem\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\",\"passphrase\":\"optional\"}; keyboard_interactive = {\"type\":\"keyboard_interactive\",\"answers\":[\"answer1\",\"answer2\"]}. jump_hosts is an ordered bastion chain: [{\"host\":\"bastion.example.com\",\"port\":22,\"user\":\"root\",\"auth\":{...}}], and each hop has its own auth object. env is a string key/value object applied to interactive sessions. Secrets are stored encrypted and are write-only to AI; read tools return redacted summaries. Returns the new host_id."
     )]
     async fn host_add(
         &self,
@@ -194,7 +194,9 @@ impl McpServer {
         Ok(Json(HostIdResult { host_id }))
     }
 
-    #[tool(description = "Update an existing host wholesale by host_id. Same shape as host_add.")]
+    #[tool(
+        description = "Update an existing host wholesale by host_id. Provide host_id plus the same full host shape as host_add: alias, host, user, auth, optional port, optional jump_hosts, optional env. Auth shapes are: {\"type\":\"password\",\"password\":\"...\"}, {\"type\":\"private_key\",\"key_pem\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\",\"passphrase\":\"optional\"}, or {\"type\":\"keyboard_interactive\",\"answers\":[\"answer1\",\"answer2\"]}. jump_hosts entries are {host, port, user, auth} and each hop authenticates independently."
+    )]
     async fn host_update(
         &self,
         Parameters(req): Parameters<UpdateHostRequest>,

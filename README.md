@@ -196,6 +196,73 @@ Security properties:
 | `session_resize`, `session_close`, `session_list` | Manage live PTY sessions. |
 | `sftp_list`, `sftp_get`, `sftp_put` | Transfer text files over SFTP. |
 
+## Host Credential Shapes
+
+`host_add` and `host_update` use the same host shape. Required fields are
+`alias`, `host`, `user`, and `auth`; optional fields are `port`, `jump_hosts`,
+and `env`.
+
+Password auth:
+
+```json
+{
+  "alias": "prod-box",
+  "host": "203.0.113.10",
+  "port": 22,
+  "user": "root",
+  "auth": { "type": "password", "password": "..." }
+}
+```
+
+Private-key auth:
+
+```json
+{
+  "alias": "key-box",
+  "host": "203.0.113.11",
+  "user": "ubuntu",
+  "auth": {
+    "type": "private_key",
+    "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
+    "passphrase": "optional"
+  }
+}
+```
+
+Keyboard-interactive auth:
+
+```json
+{
+  "alias": "mfa-box",
+  "host": "203.0.113.12",
+  "user": "admin",
+  "auth": {
+    "type": "keyboard_interactive",
+    "answers": ["password-or-first-answer", "otp-or-second-answer"]
+  }
+}
+```
+
+Jump hosts use the same auth object on every hop:
+
+```json
+{
+  "alias": "internal-box",
+  "host": "10.0.0.20",
+  "user": "root",
+  "auth": { "type": "password", "password": "..." },
+  "jump_hosts": [
+    {
+      "host": "203.0.113.100",
+      "port": 22,
+      "user": "bastion",
+      "auth": { "type": "private_key", "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\n..." }
+    }
+  ],
+  "env": { "TERM": "xterm-256color" }
+}
+```
+
 ## Exec Payloads
 
 Prefer `argv`:
