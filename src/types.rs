@@ -91,6 +91,9 @@ pub struct HostConfig {
     /// Extra environment to set on interactive sessions.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Optional post-login privilege escalation for PTY sessions.
+    #[serde(default)]
+    pub become_root: Option<BecomeRootConfig>,
 }
 
 impl HostConfig {
@@ -101,7 +104,48 @@ impl HostConfig {
         for h in &mut c.jump_hosts {
             h.auth = h.auth.redacted();
         }
+        if let Some(become_root) = &mut c.become_root {
+            become_root.password = "***".into();
+        }
         c
+    }
+}
+
+/// Human Web-UI host view. This includes editable non-secret configuration
+/// while keeping all secret fields redacted.
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDetail {
+    pub host_id: String,
+    pub alias: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: AuthMethod,
+    pub auth_kind: String,
+    pub jump_hosts: Vec<JumpHop>,
+    pub jump_count: usize,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub become_root: Option<BecomeRootConfig>,
+    pub status: HostStatus,
+}
+
+impl HostDetail {
+    pub fn from_config(c: &HostConfig, status: HostStatus) -> Self {
+        let redacted = c.redacted();
+        Self {
+            host_id: redacted.id,
+            alias: redacted.alias,
+            host: redacted.host,
+            port: redacted.port,
+            user: redacted.user,
+            auth_kind: redacted.auth.kind().to_string(),
+            auth: redacted.auth,
+            jump_count: redacted.jump_hosts.len(),
+            jump_hosts: redacted.jump_hosts,
+            env: redacted.env,
+            become_root: redacted.become_root,
+            status,
+        }
     }
 }
 
@@ -129,6 +173,38 @@ pub struct HostSpec {
     /// Optional string environment variables applied to interactive sessions.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Optional post-login privilege escalation for PTY sessions. When set,
+    /// `session_open_root` opens a shell, sends `su -` (or command), waits for
+    /// a password prompt, and enters this root password.
+    #[serde(default)]
+    pub become_root: Option<BecomeRootConfig>,
+}
+
+/// Host-level post-login root escalation settings. This is useful when the SSH
+/// account must log in as an unprivileged user first, then run `su` to become
+/// root in an interactive PTY. The root password is stored encrypted with the
+/// host config and is never returned by MCP tools.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BecomeRootConfig {
+    /// Enable `session_open_root` for this host.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Command sent after login. Defaults to `su -`.
+    #[serde(default = "default_su_command")]
+    pub command: String,
+    /// Root password to send after the password prompt appears.
+    pub password: String,
+    /// Milliseconds to wait for the password prompt before sending the password.
+    #[serde(default = "default_become_prompt_timeout_ms")]
+    pub prompt_timeout_ms: u64,
+}
+
+fn default_su_command() -> String {
+    "su -".to_string()
+}
+
+fn default_become_prompt_timeout_ms() -> u64 {
+    5000
 }
 
 /// Connection state of a host's transport.

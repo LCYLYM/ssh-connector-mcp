@@ -32,7 +32,8 @@ SSH Connector MCP separates these responsibilities:
 - **Loopback-only service**: Web UI and Streamable HTTP MCP bind to `127.0.0.1` by design.
 - **Short commands done safely**: `exec` supports `argv` with POSIX quoting, `script` for multi-line jobs, and `raw` only when you intentionally own shell quoting.
 - **Persistent interactive sessions**: open PTY sessions, send text/keys, read structured screen snapshots, resize, and close.
-- **SFTP built in**: list directories, read UTF-8 text files, and write files without shell quoting tricks.
+- **Binary-safe SFTP**: text/base64 helpers plus bounded, chunked path transfers for large binaries without putting file bytes in model context.
+- **Destination-safe file commits**: optional parent creation, no-clobber by default, same-directory temporary files, overwrite rollback, failure cleanup, size checks, and local/server-side SHA-256 verification.
 - **Connection lifecycle**: SSH transports are pooled and reused; one-shot operations connect on demand; removing a host drops its live connection.
 - **Jump hosts and multiple auth modes**: password, private key with optional passphrase, keyboard-interactive, and per-hop jump chains.
 - **Audit log**: vault, host, exec, PTY, and SFTP operations are recorded locally.
@@ -102,6 +103,11 @@ openclaw mcp add ssh-connector \
   --transport streamable-http
 openclaw mcp doctor ssh-connector --probe
 ```
+
+This requires an OpenClaw release that exposes `openclaw mcp`. If that
+subcommand is unavailable, use the JSON configuration below and restart or
+reload the OpenClaw process that owns MCP clients. See the
+[official OpenClaw MCP reference](https://docs.openclaw.ai/cli/mcp).
 
 Or add the server to OpenClaw's MCP configuration:
 
@@ -188,19 +194,21 @@ Security properties:
 | --- | --- |
 | `host_list` | List configured hosts with redacted metadata and connection status. |
 | `host_add`, `host_update`, `host_remove` | Manage host entries while storing secrets encrypted. |
-| `host_connect` | Explicitly establish SSH transport and TOFU host key recording. |
+| `host_connect`, `host_disconnect` | Explicitly establish or drop SSH transport and TOFU host key recording. |
 | `exec` | Run one-shot `argv`, `script`, or `raw` commands and return stdout/stderr/exit code. |
-| `session_open` | Open a persistent interactive PTY session. |
+| `session_open`, `session_open_root` | Open a persistent interactive PTY session, optionally auto-running `su -` to root. |
 | `session_send_text`, `session_send_key` | Drive PTY input. |
 | `session_screen`, `session_read` | Inspect PTY screen or incremental output. |
 | `session_resize`, `session_close`, `session_list` | Manage live PTY sessions. |
-| `sftp_list`, `sftp_get`, `sftp_put` | Transfer text files over SFTP. |
+| `sftp_list`, `sftp_get`, `sftp_put` | Transfer UTF-8 text files over SFTP. |
+| `sftp_download_file`, `sftp_upload_file` | Stream large binary files by local path with parent creation, overwrite control, temporary-file commit, cleanup, and SHA-256 verification. |
+| `sftp_get_base64`, `sftp_put_base64` | Transfer small binary payloads as base64 when the content safely fits in MCP context. |
 
 ## Host Credential Shapes
 
 `host_add` and `host_update` use the same host shape. Required fields are
 `alias`, `host`, `user`, and `auth`; optional fields are `port`, `jump_hosts`,
-and `env`.
+`env`, and `become_root`.
 
 Password auth:
 
@@ -263,6 +271,39 @@ Jump hosts use the same auth object on every hop:
 }
 ```
 
+Login as a normal user, then open root PTY sessions with `su -`:
+
+```json
+{
+  "alias": "root-via-su",
+  "host": "203.0.113.20",
+  "user": "deploy",
+  "auth": {
+    "type": "private_key",
+    "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\n..."
+  },
+  "become_root": {
+    "enabled": true,
+    "command": "su -",
+    "password": "root-password",
+    "prompt_timeout_ms": 5000
+  }
+}
+```
+
+Then use:
+
+```json
+{
+  "host_id": "host-id",
+  "rows": 24,
+  "cols": 100
+}
+```
+
+with `session_open_root`. The root password stays encrypted in the vault and is
+not passed in the tool call.
+
 ## Exec Payloads
 
 Prefer `argv`:
@@ -305,6 +346,62 @@ Result shape:
   "had_invalid_utf8": false
 }
 ```
+
+## SFTP Payloads
+
+Use `sftp_get` / `sftp_put` only for UTF-8 text.
+
+For large zip/tar/gz archives, installers, APKs, images, databases, compiled
+binaries, or any exact-byte transfer that may exceed model context limits, use
+path-based transfer. File content is not placed in tool parameters or responses.
+Local paths are restricted to `/tmp` and the daemon's current project directory.
+
+Both path tools stream data in bounded chunks. Downloads write to a hidden
+same-directory local `.part` file, sync it, verify local and remote SHA-256, and
+then commit it without exposing a partial destination. Uploads use a hidden
+remote `.part` file, verify its size and server-side SHA-256 without downloading
+the file again, and then rename it into place. Replacing an existing remote file
+first stages a same-directory backup and rolls it back when commit fails.
+Ordinary failures remove transfer temporary files. SHA-256 verification requires
+`sha256sum` or `shasum` on the remote host.
+
+```json
+{
+  "host_id": "host-id",
+  "remote_path": "/tmp/app-release.apk",
+  "local_path": "/tmp/app-release.apk",
+  "overwrite": false,
+  "create_parent_dirs": true,
+  "chunk_size_bytes": 262144,
+  "verify_sha256": true
+}
+```
+
+with `sftp_download_file`, or:
+
+```json
+{
+  "host_id": "host-id",
+  "local_path": "/tmp/package.tar.gz",
+  "remote_path": "/tmp/releases/package.tar.gz",
+  "overwrite": false,
+  "create_parent_dirs": true,
+  "chunk_size_bytes": 262144,
+  "verify_sha256": true
+}
+```
+
+with `sftp_upload_file`.
+
+`overwrite` defaults to `false`; `create_parent_dirs` and `verify_sha256`
+default to `true`. `chunk_size_bytes` defaults to 256 KiB and accepts 64 KiB
+through 8 MiB. Remote reads use eight ordered in-flight ranges, so memory stays
+bounded while avoiding one network round trip per SFTP packet. Results include
+`bytes`, `sha256`, and `verified`.
+
+Use `sftp_get_base64` / `sftp_put_base64` only for small binary payloads where
+embedding base64 in MCP JSON is acceptable. An 84 MB APK becomes roughly 112 MB
+of base64 before JSON overhead, so it must use path-based transfer.
 
 ## Build From Source
 
@@ -363,28 +460,38 @@ target/release/ssh-connector --data-dir "$DATA_DIR" &
 python3 tests/smoke_http_mcp.py http://127.0.0.1:7600
 ```
 
-Real SSH end-to-end test requires your own test hosts:
+The opt-in real E2E uses one disposable root-managed test host. It creates one
+temporary user and two isolated high-port `sshd` instances, then removes them:
 
 ```bash
-export BASE='http://127.0.0.1:7600'
-export MP='test-master-password'
-export H1_HOST='example-host-1'
-export H2_HOST='example-host-2'
-export H1_USER='root'
-export H2_USER='root'
-export P1='host-1-password'
-export P2='host-2-password'
-python3 tests/deliver_test.py
+export E2E_HOST='test-host.example'
+export E2E_BOOTSTRAP_KEY='/absolute/path/to/root-test-key'
+python3 tests/real_e2e.py
 ```
 
-The E2E test covers host CRUD, redaction, SSH connect, `exec` with argv/raw/script, injection resistance, PTY interaction, SFTP round trip, credential reveal gate, and audit logs.
+The default transfers 84 MiB in both directions. On an outbound-constrained
+test host, set `E2E_SKIP_LARGE_DOWNLOAD=1` to verify the 84 MiB upload and use
+the 1 MiB overwrite fixture for the download leg.
+
+The real E2E covers locked/unlocked vault behavior, password, encrypted private
+key/passphrase, keyboard-interactive, jump-host success and failure, final-target
+error classification, TOFU mismatch, an 84 MiB binary transfer, create and
+overwrite behavior, parent creation, failed-transfer cleanup, SHA-256 equality,
+and the master-password-only Web reveal boundary.
+
+Authentication failures use stable codes including `ssh_connect_failed`,
+`auth_failed`, `private_key_invalid`, `private_key_passphrase_required`,
+`private_key_passphrase_invalid`, `keyboard_interactive_failed`,
+`jump_failed_at_hop`, and `host_key_mismatch`. Jump errors include a redacted
+`cause_code`, `hop_index`, and `stage`; final-target errors preserve their root
+code instead of being mislabeled as jump failures.
 
 ## Known Limits
 
 - The HTTP server is intentionally loopback-only and does not implement remote auth.
 - `sftp_get` is optimized for text files; binary files are returned lossy as UTF-8 with an invalid UTF-8 flag.
 - TOFU host key trust is recorded on first connect; there is no preloaded known_hosts import yet.
-- There is no dedicated `host_disconnect` tool yet; removing a host drops its live connection.
+- A process crash or machine power loss can leave a hidden `.part`/`.backup` file; normal tool errors clean these files automatically and never publish a partial destination.
 
 ## License
 

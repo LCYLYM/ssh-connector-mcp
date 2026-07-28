@@ -13,12 +13,14 @@
 use crate::error::ConnectorError;
 use crate::state::AppState;
 use crate::types::{ExecPayload, HostSpec, KeyName};
+use base64::Engine;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{JsonObject, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 
 fn err_to_mcp(e: ConnectorError) -> ErrorData {
@@ -51,9 +53,53 @@ pub struct HostIdRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecRequest {
     pub host_id: String,
-    /// Exactly one of argv / script / raw.
-    #[serde(flatten)]
-    pub payload: ExecPayload,
+    /// Preferred one-shot command form. Exactly one of argv, script, or raw must be provided.
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    /// Multi-line shell script content. Exactly one of argv, script, or raw must be provided.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Raw command string. Exactly one of argv, script, or raw must be provided.
+    #[serde(default)]
+    pub raw: Option<String>,
+}
+
+struct NormalizedExecRequest {
+    host_id: String,
+    payload: ExecPayload,
+}
+
+fn exec_payload_from_request(req: ExecRequest) -> Result<NormalizedExecRequest, ErrorData> {
+    let selected = [
+        req.argv.as_ref().map(|_| "argv"),
+        req.script.as_ref().map(|_| "script"),
+        req.raw.as_ref().map(|_| "raw"),
+    ]
+    .into_iter()
+    .flatten()
+    .count();
+
+    if selected != 1 {
+        return Err(ErrorData::invalid_params(
+            "exec requires exactly one of argv, script, or raw",
+            None,
+        ));
+    }
+
+    let payload = if let Some(argv) = req.argv {
+        ExecPayload::Argv { argv }
+    } else if let Some(script) = req.script {
+        ExecPayload::Script { script }
+    } else if let Some(raw) = req.raw {
+        ExecPayload::Raw { raw }
+    } else {
+        unreachable!("selected count was checked");
+    };
+
+    Ok(NormalizedExecRequest {
+        host_id: req.host_id,
+        payload,
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -116,6 +162,62 @@ pub struct SftpPutRequest {
     pub content: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SftpPutBase64Request {
+    pub host_id: String,
+    pub path: String,
+    /// Base64-encoded file content for small binary-safe uploads.
+    pub content_base64: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SftpDownloadFileRequest {
+    pub host_id: String,
+    pub remote_path: String,
+    /// Local destination path. Must be under /tmp or the daemon's current project directory.
+    pub local_path: String,
+    /// Defaults to false. Set true to overwrite an existing local destination.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Create missing local parent directories. Defaults to true.
+    #[serde(default = "default_true")]
+    pub create_parent_dirs: bool,
+    /// Streaming buffer size, from 64 KiB through 8 MiB. Defaults to 256 KiB.
+    #[serde(default = "default_transfer_chunk_size")]
+    pub chunk_size_bytes: usize,
+    /// Compare the received stream, local temp file, and remote SHA-256. Defaults to true.
+    #[serde(default = "default_true")]
+    pub verify_sha256: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SftpUploadFileRequest {
+    pub host_id: String,
+    /// Local source file path. Must be under /tmp or the daemon's current project directory.
+    pub local_path: String,
+    pub remote_path: String,
+    /// Defaults to false. Set true to replace an existing remote file.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Create missing remote parent directories. Defaults to true.
+    #[serde(default = "default_true")]
+    pub create_parent_dirs: bool,
+    /// Streaming buffer size, from 64 KiB through 8 MiB. Defaults to 256 KiB.
+    #[serde(default = "default_transfer_chunk_size")]
+    pub chunk_size_bytes: usize,
+    /// Compare local and server-side SHA-256 before commit. Defaults to true.
+    #[serde(default = "default_true")]
+    pub verify_sha256: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_transfer_chunk_size() -> usize {
+    256 * 1024
+}
+
 /// The MCP tool server. Clones share one `Arc<AppState>`.
 #[derive(Clone)]
 pub struct McpServer {
@@ -164,13 +266,159 @@ pub struct SftpGetResult {
     pub had_invalid_utf8: bool,
 }
 
+#[derive(Debug, serde::Serialize, JsonSchema)]
+pub struct SftpGetBase64Result {
+    pub content_base64: String,
+    pub bytes: usize,
+}
+
+#[derive(Debug, serde::Serialize, JsonSchema)]
+pub struct SftpFileTransferResult {
+    pub local_path: String,
+    pub remote_path: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub verified: bool,
+}
+
 impl McpServer {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self {
-            state,
-            tool_router: Self::tool_router(),
+        let mut tool_router = Self::tool_router();
+        sanitize_tool_schemas_for_ai_clients(&mut tool_router);
+        Self { state, tool_router }
+    }
+}
+
+/// Codex and some OpenAI-compatible clients are stricter than full JSON Schema:
+/// they expect OpenAI function-style parameter schemas and may reject a whole
+/// MCP server when any tool advertises `oneOf`, `$defs/$ref`, nullable type
+/// arrays, or Rust-specific integer formats. Keep the business structs typed,
+/// but publish a conservative schema surface.
+fn sanitize_tool_schemas_for_ai_clients(router: &mut ToolRouter<McpServer>) {
+    for route in router.map.values_mut() {
+        route.attr.input_schema = Arc::new(sanitize_schema_object(&route.attr.input_schema));
+        route.attr.output_schema = None;
+    }
+}
+
+fn sanitize_schema_object(schema: &JsonObject) -> JsonObject {
+    let mut root = Value::Object(schema.clone());
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    sanitize_schema_value(&mut root, &defs);
+    match root {
+        Value::Object(map) => map,
+        _ => JsonObject::new(),
+    }
+}
+
+fn sanitize_schema_value(value: &mut Value, defs: &Map<String, Value>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(replacement) = expand_ref(map, defs) {
+                *value = replacement;
+                sanitize_schema_value(value, defs);
+                return;
+            }
+
+            let one_of = map.remove("oneOf").or_else(|| map.remove("anyOf"));
+            if let Some(Value::Array(variants)) = one_of {
+                merge_variants_into_object(map, variants, defs);
+            }
+
+            map.remove("$schema");
+            map.remove("$defs");
+            map.remove("format");
+            map.remove("const");
+
+            if let Some(Value::Array(types)) = map.get_mut("type") {
+                let first_non_null = types
+                    .iter()
+                    .find(|ty| ty.as_str() != Some("null"))
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("string".to_string()));
+                map.insert("type".to_string(), first_non_null);
+            }
+
+            for child in map.values_mut() {
+                sanitize_schema_value(child, defs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_schema_value(item, defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expand_ref(map: &Map<String, Value>, defs: &Map<String, Value>) -> Option<Value> {
+    let ref_name = map
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|s| s.strip_prefix("#/$defs/"))?;
+    let mut replacement = defs.get(ref_name)?.clone();
+    if let (Value::Object(dst), Some(description)) =
+        (&mut replacement, map.get("description").cloned())
+    {
+        dst.entry("description".to_string()).or_insert(description);
+    }
+    Some(replacement)
+}
+
+fn merge_variants_into_object(
+    map: &mut Map<String, Value>,
+    variants: Vec<Value>,
+    defs: &Map<String, Value>,
+) {
+    let mut merged_props = Map::new();
+    let mut enum_values = Vec::new();
+
+    for mut variant in variants {
+        sanitize_schema_value(&mut variant, defs);
+        let Value::Object(obj) = variant else {
+            continue;
+        };
+
+        if let Some(Value::Array(values)) = obj.get("enum") {
+            enum_values.extend(values.iter().cloned());
+        }
+
+        if let Some(Value::Object(props)) = obj.get("properties") {
+            for (key, value) in props {
+                merged_props
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
         }
     }
+
+    if !merged_props.is_empty() {
+        let props = map
+            .entry("properties".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(existing) = props {
+            for (key, value) in merged_props {
+                existing.entry(key).or_insert(value);
+            }
+        }
+    }
+
+    if !enum_values.is_empty() {
+        map.insert("enum".to_string(), Value::Array(enum_values));
+        map.insert("type".to_string(), Value::String("string".to_string()));
+    } else {
+        map.entry("type".to_string())
+            .or_insert_with(|| Value::String("object".to_string()));
+    }
+
+    // The runtime still validates the real typed shape. For schema conversion,
+    // optional is better than advertising impossible cross-variant requirements.
+    map.remove("required");
 }
 
 #[tool_router]
@@ -184,7 +432,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Create a new SSH host and encrypted credential entry. Required fields: alias, host, user, auth. Optional fields: port (default 22), jump_hosts, env. Auth is a tagged object: password = {\"type\":\"password\",\"password\":\"...\"}; private_key = {\"type\":\"private_key\",\"key_pem\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\",\"passphrase\":\"optional\"}; keyboard_interactive = {\"type\":\"keyboard_interactive\",\"answers\":[\"answer1\",\"answer2\"]}. jump_hosts is an ordered bastion chain: [{\"host\":\"bastion.example.com\",\"port\":22,\"user\":\"root\",\"auth\":{...}}], and each hop has its own auth object. env is a string key/value object applied to interactive sessions. Secrets are stored encrypted and are write-only to AI; read tools return redacted summaries. Returns the new host_id."
+        description = "Create a new SSH host and encrypted credential entry. Required fields: alias, host, user, auth. Optional fields: port (default 22), jump_hosts, env, become_root. Auth is a tagged object: password = {\"type\":\"password\",\"password\":\"...\"}; private_key = {\"type\":\"private_key\",\"key_pem\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\",\"passphrase\":\"optional\"}; keyboard_interactive = {\"type\":\"keyboard_interactive\",\"answers\":[\"answer1\",\"answer2\"]}. jump_hosts is an ordered bastion chain: [{\"host\":\"bastion.example.com\",\"port\":22,\"user\":\"root\",\"auth\":{...}}], and each hop has its own auth object. become_root enables login-as-user-then-su workflows for session_open_root: {\"enabled\":true,\"command\":\"su -\",\"password\":\"root-password\",\"prompt_timeout_ms\":5000}. env is a string key/value object applied to interactive sessions. Secrets are stored encrypted and are write-only to AI; read tools return redacted summaries. Returns the new host_id."
     )]
     async fn host_add(
         &self,
@@ -195,7 +443,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update an existing host wholesale by host_id. Provide host_id plus the same full host shape as host_add: alias, host, user, auth, optional port, optional jump_hosts, optional env. Auth shapes are: {\"type\":\"password\",\"password\":\"...\"}, {\"type\":\"private_key\",\"key_pem\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\",\"passphrase\":\"optional\"}, or {\"type\":\"keyboard_interactive\",\"answers\":[\"answer1\",\"answer2\"]}. jump_hosts entries are {host, port, user, auth} and each hop authenticates independently."
+        description = "Update an existing host wholesale by host_id. Provide host_id plus the same full host shape as host_add: alias, host, user, auth, optional port, optional jump_hosts, optional env, optional become_root. Auth shapes are: {\"type\":\"password\",\"password\":\"...\"}, {\"type\":\"private_key\",\"key_pem\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\",\"passphrase\":\"optional\"}, or {\"type\":\"keyboard_interactive\",\"answers\":[\"answer1\",\"answer2\"]}. jump_hosts entries are {host, port, user, auth} and each hop authenticates independently. become_root is {\"enabled\":true,\"command\":\"su -\",\"password\":\"root-password\",\"prompt_timeout_ms\":5000} for session_open_root."
     )]
     async fn host_update(
         &self,
@@ -236,15 +484,32 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Disconnect and drop a host's live SSH transport. One-shot exec, PTY, and SFTP can reconnect on demand later."
+    )]
+    async fn host_disconnect(
+        &self,
+        Parameters(req): Parameters<HostIdRequest>,
+    ) -> Result<Json<ConnectResult>, ErrorData> {
+        self.state
+            .disconnect_host(&req.host_id)
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(Json(ConnectResult {
+            status: "disconnected".into(),
+        }))
+    }
+
+    #[tool(
         description = "Run a one-shot command and wait for it to finish. Choose exactly one payload: `argv` (array, auto-quoted — preferred), `script` (multi-line, uploaded and run as a file), or `raw` (you own all quoting). Returns stdout/stderr/exit_code with truncation and timeout flags."
     )]
     async fn exec(
         &self,
         Parameters(req): Parameters<ExecRequest>,
     ) -> Result<Json<crate::types::ExecResult>, ErrorData> {
+        let payload = exec_payload_from_request(req)?;
         let r = self
             .state
-            .exec(&req.host_id, &req.payload)
+            .exec(&payload.host_id, &payload.payload)
             .await
             .map_err(err_to_mcp)?;
         Ok(Json(r))
@@ -260,6 +525,21 @@ impl McpServer {
         let info = self
             .state
             .open_pty(&req.host_id, req.rows, req.cols)
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(Json(info))
+    }
+
+    #[tool(
+        description = "Open a persistent interactive PTY session and automatically become root using the host's encrypted become_root config. Configure hosts with become_root: {\"enabled\":true,\"command\":\"su -\",\"password\":\"root-password\",\"prompt_timeout_ms\":5000}. This is for login-as-user-then-`su` workflows; it does not expose the root password to the AI."
+    )]
+    async fn session_open_root(
+        &self,
+        Parameters(req): Parameters<OpenPtyRequest>,
+    ) -> Result<Json<crate::types::SessionInfo>, ErrorData> {
+        let info = self
+            .state
+            .open_root_pty(&req.host_id, req.rows, req.cols)
             .await
             .map_err(err_to_mcp)?;
         Ok(Json(info))
@@ -389,7 +669,25 @@ impl McpServer {
         }))
     }
 
-    #[tool(description = "Write a remote file over SFTP (overwrites).")]
+    #[tool(
+        description = "Read a small remote file over SFTP as base64. Use only for small binary files where returning content in the MCP response is acceptable. For large files, archives, APKs, zip/tar/gz, installers, images, or anything likely to exceed context limits, use sftp_download_file instead."
+    )]
+    async fn sftp_get_base64(
+        &self,
+        Parameters(req): Parameters<SftpGetRequest>,
+    ) -> Result<Json<SftpGetBase64Result>, ErrorData> {
+        let bytes = self
+            .state
+            .sftp_get(&req.host_id, &req.path)
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(Json(SftpGetBase64Result {
+            content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            bytes: bytes.len(),
+        }))
+    }
+
+    #[tool(description = "Write a remote UTF-8 text file over SFTP (overwrites).")]
     async fn sftp_put(
         &self,
         Parameters(req): Parameters<SftpPutRequest>,
@@ -400,9 +698,84 @@ impl McpServer {
             .map_err(err_to_mcp)?;
         Ok(Json(OkResult { ok: true }))
     }
+
+    #[tool(
+        description = "Write a small remote file over SFTP from base64 (overwrites). Use only for small binary payloads. For large files, archives, APKs, zip/tar/gz, installers, images, or anything likely to exceed context limits, put the file under /tmp or the current project and use sftp_upload_file instead."
+    )]
+    async fn sftp_put_base64(
+        &self,
+        Parameters(req): Parameters<SftpPutBase64Request>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(req.content_base64.as_bytes())
+            .map_err(|e| ErrorData::invalid_params(format!("invalid base64 content: {e}"), None))?;
+        self.state
+            .sftp_put(&req.host_id, &req.path, &bytes)
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Atomically download a remote file over SFTP to a local path without putting content in MCP context. local_path must be under /tmp or the daemon's current project. The transfer streams in configurable chunks to a same-directory .part file, creates missing local parents by default, fsyncs, verifies size and SHA-256 by default, then commits without exposing a partial destination. overwrite defaults to false. Returns bytes, sha256, and verified. Prefer this for large binaries, archives, APKs, installers, images, and exact-byte transfers."
+    )]
+    async fn sftp_download_file(
+        &self,
+        Parameters(req): Parameters<SftpDownloadFileRequest>,
+    ) -> Result<Json<SftpFileTransferResult>, ErrorData> {
+        let r = self
+            .state
+            .sftp_download_file(
+                &req.host_id,
+                &req.remote_path,
+                &req.local_path,
+                req.overwrite,
+                req.create_parent_dirs,
+                req.chunk_size_bytes,
+                req.verify_sha256,
+            )
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(Json(SftpFileTransferResult {
+            local_path: r.local_path.display().to_string(),
+            remote_path: r.remote_path,
+            bytes: r.bytes,
+            sha256: r.sha256,
+            verified: r.verified,
+        }))
+    }
+
+    #[tool(
+        description = "Atomically upload a local file over SFTP without putting content in MCP parameters. local_path must be under /tmp or the daemon's current project. The transfer streams in configurable chunks to a same-directory remote .part file, creates missing remote parents by default, verifies remote size and SHA-256 by default, then renames into place. overwrite defaults to false and uses a rollback backup when replacing. Failed transfers remove temporary files. Returns bytes, sha256, and verified. Prefer this for large binaries, archives, APKs, installers, images, and exact-byte transfers."
+    )]
+    async fn sftp_upload_file(
+        &self,
+        Parameters(req): Parameters<SftpUploadFileRequest>,
+    ) -> Result<Json<SftpFileTransferResult>, ErrorData> {
+        let r = self
+            .state
+            .sftp_upload_file(
+                &req.host_id,
+                &req.local_path,
+                &req.remote_path,
+                req.overwrite,
+                req.create_parent_dirs,
+                req.chunk_size_bytes,
+                req.verify_sha256,
+            )
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(Json(SftpFileTransferResult {
+            local_path: r.local_path.display().to_string(),
+            remote_path: r.remote_path,
+            bytes: r.bytes,
+            sha256: r.sha256,
+            verified: r.verified,
+        }))
+    }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
@@ -416,8 +789,11 @@ impl ServerHandler for McpServer {
              host_id, but you can never read stored credentials. Prefer `exec` with the `argv` \
              payload for one-shot commands because it is auto-quoted. Use `script` for multi-line \
              non-interactive work, `raw` only when you intentionally own shell quoting, \
-             `session_open` for stateful interactive work (editors, REPLs, prompts), and SFTP tools \
-             for remote file transfer.",
+             `session_open` for stateful interactive work (editors, REPLs, prompts), \
+             `session_open_root` when the host is configured to log in as a normal user and then \
+             run `su -` to root, text SFTP for UTF-8 files, `sftp_download_file`/`sftp_upload_file` \
+             for large binary files, archives, packages, images, APKs, and exact-byte file transfer, \
+             and base64 SFTP tools only for small binary payloads that safely fit in MCP context.",
         )
     }
 }
@@ -445,4 +821,39 @@ pub async fn serve_stdio(state: Arc<AppState>) -> anyhow::Result<()> {
     let service = McpServer::new(state).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_tool_surface_has_transfers_but_no_credential_reveal() {
+        let router = McpServer::tool_router();
+        let names: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name == "sftp_download_file"));
+        assert!(names.iter().any(|name| name == "sftp_upload_file"));
+        assert!(!names.iter().any(|name| name.contains("reveal")));
+        assert!(!names.iter().any(|name| name.contains("credential_get")));
+    }
+
+    #[test]
+    fn large_transfer_schema_exposes_safety_controls() {
+        let mut router = McpServer::tool_router();
+        sanitize_tool_schemas_for_ai_clients(&mut router);
+        let upload = router.get("sftp_upload_file").unwrap();
+        let properties = upload.input_schema["properties"].as_object().unwrap();
+        for field in [
+            "overwrite",
+            "create_parent_dirs",
+            "chunk_size_bytes",
+            "verify_sha256",
+        ] {
+            assert!(properties.contains_key(field), "missing {field}");
+        }
+    }
 }

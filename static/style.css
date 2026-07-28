@@ -482,7 +482,7 @@ fieldset legend { padding: 0 7px; }
 .audit-list { padding: 18px 32px 32px; display: flex; flex-direction: column; gap: 8px; }
 .audit-entry {
   display: grid;
-  grid-template-columns: 180px 120px 1fr auto;
+  grid-template-columns: 180px 120px minmax(120px, 1fr) minmax(220px, 2fr);
   gap: 14px;
   align-items: baseline;
   padding: 11px 12px;
@@ -495,7 +495,13 @@ fieldset legend { padding: 0 7px; }
 .audit-ts, .mono, .badge-auth, .audit-code { font-family: var(--font-mono); }
 .audit-ts { color: var(--color-text-soft); font-size: 11px; }
 .audit-action { color: var(--color-brand); font-weight: 700; }
-.audit-detail, .audit-host { color: var(--color-text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.audit-host { color: var(--color-text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.audit-detail {
+  color: var(--color-text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
 .badge-auth {
   display: inline-flex;
   padding: 3px 7px;

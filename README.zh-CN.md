@@ -32,7 +32,8 @@ SSH Connector MCP 把职责拆开：
 - **仅监听本机**：Web UI 和 Streamable HTTP MCP 都绑定 `127.0.0.1`。
 - **安全短命令**：`exec` 支持自动 POSIX 转义的 `argv`、多行 `script`，以及明确自负 shell quoting 的 `raw`。
 - **持久交互会话**：可打开 PTY、发送文本/按键、读取结构化屏幕、调整尺寸和关闭。
-- **内置 SFTP**：列目录、读取 UTF-8 文本文件、写文件，不需要临时 shell quoting。
+- **二进制安全 SFTP**：文本/base64 小文件工具，加上不会把文件字节塞进模型上下文的有界分块路径传输。
+- **目标文件安全提交**：支持父目录创建、默认禁止覆盖、同目录临时文件、覆盖回滚、失败清理、大小检查和本地/远端本机 SHA-256 验证。
 - **连接生命周期**：SSH transport 会复用；一次性操作按需连接；删除主机会断开对应 live connection。
 - **跳板和多认证方式**：支持密码、带可选 passphrase 的私钥、keyboard-interactive，以及每跳独立认证的跳板链。
 - **审计日志**：vault、主机、exec、PTY 和 SFTP 操作都写入本地审计记录。
@@ -102,6 +103,10 @@ openclaw mcp add ssh-connector \
   --transport streamable-http
 openclaw mcp doctor ssh-connector --probe
 ```
+
+该命令需要 OpenClaw 版本已提供 `openclaw mcp`。如果当前版本没有该子命令，
+请使用下方 JSON 配置，然后重启或 reload 实际持有 MCP client 的 OpenClaw 进程。
+详见 [OpenClaw 官方 MCP 文档](https://docs.openclaw.ai/cli/mcp)。
 
 也可以写入 OpenClaw MCP 配置：
 
@@ -188,18 +193,20 @@ Network: 127.0.0.1 only
 | --- | --- |
 | `host_list` | 列出配置主机、脱敏元数据和连接状态。 |
 | `host_add`, `host_update`, `host_remove` | 管理主机条目，凭据加密存储。 |
-| `host_connect` | 显式建立 SSH transport，并记录 TOFU host key。 |
+| `host_connect`, `host_disconnect` | 显式建立或断开 SSH transport，并记录 TOFU host key。 |
 | `exec` | 运行一次性 `argv`、`script` 或 `raw` 命令，返回 stdout/stderr/exit code。 |
-| `session_open` | 打开持久交互式 PTY 会话。 |
+| `session_open`, `session_open_root` | 打开持久交互式 PTY 会话，可自动执行 `su -` 转 root。 |
 | `session_send_text`, `session_send_key` | 驱动 PTY 输入。 |
 | `session_screen`, `session_read` | 检查 PTY 屏幕或增量输出。 |
 | `session_resize`, `session_close`, `session_list` | 管理 live PTY 会话。 |
-| `sftp_list`, `sftp_get`, `sftp_put` | 通过 SFTP 传输文本文件。 |
+| `sftp_list`, `sftp_get`, `sftp_put` | 通过 SFTP 传输 UTF-8 文本文件。 |
+| `sftp_download_file`, `sftp_upload_file` | 通过本地路径流式传输大体积二进制文件，支持父目录、覆盖控制、临时文件提交、失败清理和 SHA-256 校验。 |
+| `sftp_get_base64`, `sftp_put_base64` | 传输能安全放进 MCP 上下文的小体积二进制 payload。 |
 
 ## 主机凭据参数结构
 
 `host_add` 和 `host_update` 使用同一套主机参数。必填字段是 `alias`、
-`host`、`user`、`auth`；可选字段是 `port`、`jump_hosts`、`env`。
+`host`、`user`、`auth`；可选字段是 `port`、`jump_hosts`、`env`、`become_root`。
 
 密码认证：
 
@@ -262,6 +269,38 @@ Network: 127.0.0.1 only
 }
 ```
 
+先用普通用户登录，再通过 `su -` 打开 root PTY 会话：
+
+```json
+{
+  "alias": "root-via-su",
+  "host": "203.0.113.20",
+  "user": "deploy",
+  "auth": {
+    "type": "private_key",
+    "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\n..."
+  },
+  "become_root": {
+    "enabled": true,
+    "command": "su -",
+    "password": "root-password",
+    "prompt_timeout_ms": 5000
+  }
+}
+```
+
+之后调用 `session_open_root`：
+
+```json
+{
+  "host_id": "host-id",
+  "rows": 24,
+  "cols": 100
+}
+```
+
+root 密码保存在加密 vault 里，不需要在工具调用时再次传给 AI。
+
 ## Exec Payload
 
 优先使用 `argv`：
@@ -304,6 +343,57 @@ Network: 127.0.0.1 only
   "had_invalid_utf8": false
 }
 ```
+
+## SFTP Payload
+
+`sftp_get` / `sftp_put` 只用于 UTF-8 文本。
+
+zip/tar/gz、安装包、APK、图片、数据库、编译产物，或任何可能超过模型
+上下文的大体积精确字节传输，使用路径型传输。文件内容不会进入工具参数或
+工具返回值；本地路径只允许 `/tmp` 和 daemon 当前项目目录。
+
+两个路径工具都会有界分块流式传输。下载先写同目录隐藏 `.part` 文件，完成
+sync，并对比本地与远端 SHA-256 后再提交，不会提前暴露半个目标文件。
+上传先写远端同目录隐藏 `.part`，再在远端本机校验文件大小和 SHA-256，
+不会为了校验把整个文件再下载一次。校验后再 rename；覆盖已有文件时会先
+暂存同目录 backup，提交失败则回滚。普通错误会自动清理传输临时文件。
+SHA-256 校验需要远端存在 `sha256sum` 或 `shasum`。
+
+```json
+{
+  "host_id": "host-id",
+  "remote_path": "/tmp/app-release.apk",
+  "local_path": "/tmp/app-release.apk",
+  "overwrite": false,
+  "create_parent_dirs": true,
+  "chunk_size_bytes": 262144,
+  "verify_sha256": true
+}
+```
+
+配合 `sftp_download_file`；上传时用：
+
+```json
+{
+  "host_id": "host-id",
+  "local_path": "/tmp/package.tar.gz",
+  "remote_path": "/tmp/releases/package.tar.gz",
+  "overwrite": false,
+  "create_parent_dirs": true,
+  "chunk_size_bytes": 262144,
+  "verify_sha256": true
+}
+```
+
+配合 `sftp_upload_file`。
+
+`overwrite` 默认 `false`；`create_parent_dirs` 和 `verify_sha256` 默认
+`true`。`chunk_size_bytes` 默认 256 KiB，可设置为 64 KiB 到 8 MiB。
+远端读取采用 8 路按顺序提交的并发区间，在控制内存上限的同时避免每个
+SFTP packet 都串行等待公网往返。结果返回 `bytes`、`sha256` 和 `verified`。
+
+`sftp_get_base64` / `sftp_put_base64` 只用于小体积二进制 payload。84MB APK
+会膨胀成约 112MB base64，再加 JSON 开销，必须走路径型传输。
 
 ## 从源码构建
 
@@ -362,28 +452,35 @@ target/release/ssh-connector --data-dir "$DATA_DIR" &
 python3 tests/smoke_http_mcp.py http://127.0.0.1:7600
 ```
 
-真实 SSH 端到端测试需要你自己的测试主机：
+可选的真实 E2E 只需要一台由 root 管理的测试机。脚本会创建一个临时用户和
+两个隔离的高端口 `sshd`，结束时自动删除：
 
 ```bash
-export BASE='http://127.0.0.1:7600'
-export MP='test-master-password'
-export H1_HOST='example-host-1'
-export H2_HOST='example-host-2'
-export H1_USER='root'
-export H2_USER='root'
-export P1='host-1-password'
-export P2='host-2-password'
-python3 tests/deliver_test.py
+export E2E_HOST='test-host.example'
+export E2E_BOOTSTRAP_KEY='/absolute/path/to/root-test-key'
+python3 tests/real_e2e.py
 ```
 
-E2E 测试覆盖 host CRUD、脱敏、SSH connect、`exec` 的 argv/raw/script、注入防护、PTY 交互、SFTP 往返、凭据 reveal 门禁和审计日志。
+默认会双向传输 84 MiB。如果测试机出站带宽受限，可设置
+`E2E_SKIP_LARGE_DOWNLOAD=1`：上传仍验证 84 MiB，下载则使用 1 MiB 覆盖 fixture。
+
+真实 E2E 覆盖 vault 锁定/解锁、密码、加密私钥/passphrase、
+keyboard-interactive、跳板成功和失败、最终目标错误分类、TOFU mismatch、
+84 MiB 二进制传输、创建/覆盖、父目录创建、失败临时文件清理、SHA-256
+一致性，以及只能由主密码解锁的 Web reveal 边界。
+
+鉴权失败使用稳定错误码：`ssh_connect_failed`、`auth_failed`、
+`private_key_invalid`、`private_key_passphrase_required`、
+`private_key_passphrase_invalid`、`keyboard_interactive_failed`、
+`jump_failed_at_hop` 和 `host_key_mismatch`。跳板错误会附带脱敏后的
+`cause_code`、`hop_index`、`stage`；最终目标错误保留根因，不再误报成跳板失败。
 
 ## 已知限制
 
 - HTTP server 刻意只监听 loopback，不实现远程鉴权。
 - `sftp_get` 面向文本文件；二进制文件会以 lossy UTF-8 返回，并设置 invalid UTF-8 标志。
 - host key 使用 TOFU 首次信任；尚未导入预置 known_hosts。
-- 还没有独立 `host_disconnect` 工具；删除主机会断开 live connection。
+- 进程崩溃或机器突然断电仍可能留下隐藏 `.part`/`.backup`；普通工具错误会自动清理，且不会发布半个目标文件。
 
 ## License
 

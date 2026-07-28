@@ -21,6 +21,16 @@ pub enum ErrorCode {
     HostNotFound,
     /// SSH authentication failed at the final hop.
     AuthFailed,
+    /// TCP/SSH transport establishment failed before authentication completed.
+    SshConnectFailed,
+    /// Private key input could not be parsed.
+    PrivateKeyInvalid,
+    /// An encrypted private key was supplied without a passphrase.
+    PrivateKeyPassphraseRequired,
+    /// The supplied private-key passphrase could not decrypt the key.
+    PrivateKeyPassphraseInvalid,
+    /// Keyboard-interactive authentication failed or the exchange was rejected.
+    KeyboardInteractiveFailed,
     /// A jump-host hop failed; `context.hop_index` says which one.
     JumpFailedAtHop,
     /// Remote host key did not match the recorded TOFU fingerprint.
@@ -37,6 +47,8 @@ pub enum ErrorCode {
     BadRequest,
     /// SFTP-layer failure.
     SftpError,
+    /// Source and destination bytes or SHA-256 digests did not match.
+    TransferIntegrityFailed,
     /// Underlying I/O or protocol error not otherwise classified.
     Internal,
 }
@@ -49,6 +61,11 @@ impl ErrorCode {
             ErrorCode::VaultAlreadyInit => "vault_already_init",
             ErrorCode::HostNotFound => "host_not_found",
             ErrorCode::AuthFailed => "auth_failed",
+            ErrorCode::SshConnectFailed => "ssh_connect_failed",
+            ErrorCode::PrivateKeyInvalid => "private_key_invalid",
+            ErrorCode::PrivateKeyPassphraseRequired => "private_key_passphrase_required",
+            ErrorCode::PrivateKeyPassphraseInvalid => "private_key_passphrase_invalid",
+            ErrorCode::KeyboardInteractiveFailed => "keyboard_interactive_failed",
             ErrorCode::JumpFailedAtHop => "jump_failed_at_hop",
             ErrorCode::HostKeyMismatch => "host_key_mismatch",
             ErrorCode::Disconnected => "disconnected",
@@ -57,6 +74,7 @@ impl ErrorCode {
             ErrorCode::CredentialWriteOnly => "credential_write_only",
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::SftpError => "sftp_error",
+            ErrorCode::TransferIntegrityFailed => "transfer_integrity_failed",
             ErrorCode::Internal => "internal",
         }
     }

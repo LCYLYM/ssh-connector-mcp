@@ -75,6 +75,11 @@ const el = {
   hfKeyPem:         () => $('hf-key-pem'),
   hfKeyPassphrase:  () => $('hf-key-passphrase'),
   hfKiAnswers:      () => $('hf-ki-answers'),
+  hfBecomeRootEnabled: () => $('hf-become-root-enabled'),
+  hfBecomeRootFields:  () => $('become-root-fields'),
+  hfBecomeRootCommand: () => $('hf-become-root-command'),
+  hfBecomeRootPassword:() => $('hf-become-root-password'),
+  hfBecomeRootTimeout: () => $('hf-become-root-timeout'),
   authPasswordFields: () => $('auth-password-fields'),
   authKeyFields:    () => $('auth-key-fields'),
   authKiFields:     () => $('auth-ki-fields'),
@@ -123,6 +128,7 @@ const api = {
   updateHost:      (id, b)  => apiFetch('PUT',    `/hosts/${id}`,  b),
   deleteHost:      (id)     => apiFetch('DELETE', `/hosts/${id}`),
   connectHost:     (id)     => apiFetch('POST',   `/hosts/${id}/connect`),
+  disconnectHost:  (id)     => apiFetch('POST',   `/hosts/${id}/disconnect`),
   revealHost:      (id, mp) => apiFetch('POST',   `/hosts/${id}/reveal`, { master_password: mp }),
   getSessions:     ()       => apiFetch('GET',    '/sessions'),
   closeSession:    (id)     => apiFetch('POST',   `/sessions/${id}/close`),
@@ -278,8 +284,7 @@ function renderHosts() {
       <td>${statusBadge(h.status)}</td>
       <td class="col-actions">
         <div class="action-group">
-          <button class="btn btn-sm btn-host-connect" data-id="${h.host_id}"
-            ${h.status === 'connected' ? 'disabled' : ''}>连接</button>
+          ${hostConnectionButton(h)}
           <button class="btn btn-sm btn-host-edit" data-id="${h.host_id}">编辑</button>
           <button class="btn btn-sm btn-host-reveal" data-id="${h.host_id}">查看凭据</button>
           <button class="btn btn-sm btn-danger btn-host-delete" data-id="${h.host_id}">删除</button>
@@ -287,6 +292,15 @@ function renderHosts() {
       </td>`;
     tbody.appendChild(tr);
   });
+}
+
+function hostConnectionButton(host) {
+  if (host.status === 'connected') {
+    return `<button class="btn btn-sm btn-host-disconnect" data-id="${host.host_id}">断开</button>`;
+  }
+  const disabled = host.status === 'connecting' ? 'disabled' : '';
+  const label = host.status === 'connecting' ? '连接中…' : '连接';
+  return `<button class="btn btn-sm btn-host-connect" data-id="${host.host_id}" ${disabled}>${label}</button>`;
 }
 
 function statusBadge(status) {
@@ -321,9 +335,26 @@ async function handleHostsTableClick(e) {
   if (!btn) return;
   const id = btn.dataset.id;
   if (btn.classList.contains('btn-host-connect')) await handleConnect(id, btn);
+  else if (btn.classList.contains('btn-host-disconnect')) await handleDisconnect(id, btn);
   else if (btn.classList.contains('btn-host-edit'))   handleEditHost(id);
   else if (btn.classList.contains('btn-host-reveal')) handleReveal(id);
   else if (btn.classList.contains('btn-host-delete')) await handleDeleteHost(id, btn);
+}
+
+async function handleDisconnect(hostId, btn) {
+  if (state.inflightButtons.has(btn)) return;
+  state.inflightButtons.add(btn);
+  btn.disabled = true; btn.textContent = '断开中…';
+  try {
+    await api.disconnectHost(hostId);
+    showToast('已断开连接。', 'info');
+    await loadHosts();
+  } catch (e) {
+    showToast('断开失败: ' + describeError(e), 'error');
+    btn.disabled = false; btn.textContent = '断开';
+  } finally {
+    state.inflightButtons.delete(btn);
+  }
 }
 
 async function handleConnect(hostId, btn) {
@@ -376,6 +407,10 @@ function openHostModal(existingHost) {
     const kind = existingHost.auth_kind || 'password';
     const radio = modal.querySelector(`input[name="auth-type"][value="${kind}"]`);
     if (radio) { radio.checked = true; syncAuthFields(kind); }
+    fillAuthFields(existingHost.auth);
+    fillJumpRows(existingHost.jump_hosts || []);
+    fillEnvRows(existingHost.env || {});
+    fillBecomeRootFields(existingHost.become_root);
   } else {
     el.hostModalTitle().textContent = '添加主机';
     el.hostFormSubmit().textContent = '保存主机';
@@ -388,6 +423,7 @@ function openHostModal(existingHost) {
     el.hfKeyPem().value = '';
     el.hfKeyPassphrase().value = '';
     el.hfKiAnswers().value = '';
+    resetBecomeRootFields();
     modal.querySelector('input[name="auth-type"][value="password"]').checked = true;
     syncAuthFields('password');
   }
@@ -403,6 +439,54 @@ function syncAuthFields(type) {
   el.authKiFields().classList.toggle('hidden', type !== 'keyboard_interactive');
 }
 
+function resetBecomeRootFields() {
+  el.hfBecomeRootEnabled().checked = false;
+  el.hfBecomeRootFields().classList.add('hidden');
+  el.hfBecomeRootCommand().value = 'su -';
+  el.hfBecomeRootPassword().value = '';
+  el.hfBecomeRootTimeout().value = 5000;
+}
+
+function fillBecomeRootFields(becomeRoot) {
+  resetBecomeRootFields();
+  if (!becomeRoot) return;
+  el.hfBecomeRootEnabled().checked = !!becomeRoot.enabled;
+  el.hfBecomeRootCommand().value = becomeRoot.command || 'su -';
+  el.hfBecomeRootPassword().value = becomeRoot.password || '***';
+  el.hfBecomeRootTimeout().value = becomeRoot.prompt_timeout_ms || 5000;
+  syncBecomeRootFields();
+}
+
+function fillAuthFields(auth) {
+  el.hfPassword().value = '';
+  el.hfKeyPem().value = '';
+  el.hfKeyPassphrase().value = '';
+  el.hfKiAnswers().value = '';
+  if (!auth) return;
+  if (auth.type === 'password') {
+    el.hfPassword().value = auth.password || '***';
+  } else if (auth.type === 'private_key') {
+    el.hfKeyPem().value = auth.key_pem || '***';
+    el.hfKeyPassphrase().value = auth.passphrase || '';
+  } else if (auth.type === 'keyboard_interactive') {
+    el.hfKiAnswers().value = Array.isArray(auth.answers) ? auth.answers.join('\n') : '';
+  }
+}
+
+function fillJumpRows(jumpHosts) {
+  el.jumpHostsList().innerHTML = '';
+  jumpHosts.forEach(addJumpRow);
+}
+
+function fillEnvRows(env) {
+  el.envVarsList().innerHTML = '';
+  Object.entries(env || {}).forEach(([key, value]) => addEnvRow(key, value));
+}
+
+function syncBecomeRootFields() {
+  el.hfBecomeRootFields().classList.toggle('hidden', !el.hfBecomeRootEnabled().checked);
+}
+
 function handleEditHost(hostId) {
   const host = state.hosts.find((h) => h.host_id === hostId);
   if (host) openHostModal(host);
@@ -412,6 +496,7 @@ function addJumpRow(data) {
   const container = el.jumpHostsList();
   const row = document.createElement('div');
   row.className = 'jump-row';
+  row.dataset.auth = data?.auth ? JSON.stringify(data.auth) : '';
   row.innerHTML = `
     <div class="field-group" style="margin:0"><label>主机</label>
       <input type="text" class="jump-host" placeholder="jump.example.com" value="${escHtml(data?.host || '')}" /></div>
@@ -449,24 +534,19 @@ async function handleHostFormSubmit(e) {
     showFormError(el.hostFormError(), '别名、主机名和用户名不能为空。');
     return;
   }
-  const authType = el.hostModal().querySelector('input[name="auth-type"]:checked').value;
-  let auth;
-  if (authType === 'password') {
-    auth = { type: 'password', password: el.hfPassword().value };
-  } else if (authType === 'private_key') {
-    auth = { type: 'private_key', key_pem: el.hfKeyPem().value };
-    const pp = el.hfKeyPassphrase().value;
-    if (pp) auth.passphrase = pp;
-  } else {
-    const answers = el.hfKiAnswers().value.split('\n').map((s) => s.trim()).filter(Boolean);
-    auth = { type: 'keyboard_interactive', answers };
-  }
+  const auth = buildAuthFromForm();
   const jumpHosts = [];
   el.jumpHostsList().querySelectorAll('.jump-row').forEach((row) => {
     const jhost = row.querySelector('.jump-host').value.trim();
     const juser = row.querySelector('.jump-user').value.trim();
     const jport = parseInt(row.querySelector('.jump-port').value, 10) || 22;
-    if (jhost) jumpHosts.push({ host: jhost, user: juser, port: jport });
+    if (jhost) {
+      let jumpAuth = structuredClone(auth);
+      if (row.dataset.auth) {
+        try { jumpAuth = JSON.parse(row.dataset.auth); } catch {}
+      }
+      jumpHosts.push({ host: jhost, user: juser, port: jport, auth: jumpAuth });
+    }
   });
   const env = {};
   el.envVarsList().querySelectorAll('.env-row').forEach((row) => {
@@ -475,6 +555,19 @@ async function handleHostFormSubmit(e) {
     if (k) env[k] = v;
   });
   const body = { alias, host, port, user, auth, jump_hosts: jumpHosts, env };
+  if (el.hfBecomeRootEnabled().checked) {
+    const password = el.hfBecomeRootPassword().value;
+    if (!password) {
+      showFormError(el.hostFormError(), '启用登入后转 root 时，root 密码不能为空。');
+      return;
+    }
+    body.become_root = {
+      enabled: true,
+      command: el.hfBecomeRootCommand().value.trim() || 'su -',
+      password,
+      prompt_timeout_ms: parseInt(el.hfBecomeRootTimeout().value, 10) || 5000,
+    };
+  }
   const hostId = el.hostIdField().value;
   el.hostFormSubmit().disabled = true;
   el.hostFormSubmit().textContent = '保存中…';
@@ -494,6 +587,21 @@ async function handleHostFormSubmit(e) {
     el.hostFormSubmit().disabled = false;
     el.hostFormSubmit().textContent = hostId ? '保存更改' : '保存主机';
   }
+}
+
+function buildAuthFromForm() {
+  const authType = el.hostModal().querySelector('input[name="auth-type"]:checked').value;
+  if (authType === 'password') {
+    return { type: 'password', password: el.hfPassword().value };
+  }
+  if (authType === 'private_key') {
+    const auth = { type: 'private_key', key_pem: el.hfKeyPem().value };
+    const pp = el.hfKeyPassphrase().value;
+    if (pp) auth.passphrase = pp;
+    return auth;
+  }
+  const answers = el.hfKiAnswers().value.split('\n').map((s) => s.trim()).filter(Boolean);
+  return { type: 'keyboard_interactive', answers };
 }
 
 // ── Reveal credentials modal ────────────────────────────────────
@@ -767,7 +875,7 @@ function renderAudit(entries) {
     const rawAction = entry.action || entry.event || JSON.stringify(entry).slice(0, 80);
     const action = auditActionLabel(rawAction);
     const host = entry.host || entry.alias || entry.host_id || '';
-    const detail = entry.detail || entry.message || entry.error || '';
+    const detail = auditDetailText(entry);
     const exitCode = entry.exit_code != null ? `退出码:${entry.exit_code}` : '';
     div.innerHTML = `
       <span class="audit-ts">${escHtml(ts)}</span>
@@ -776,6 +884,14 @@ function renderAudit(entries) {
       <span class="audit-detail">${escHtml(detail)} ${escHtml(exitCode)}</span>`;
     list.appendChild(div);
   });
+}
+
+function auditDetailText(entry) {
+  if (entry.detail != null) {
+    if (typeof entry.detail === 'string') return entry.detail;
+    return JSON.stringify(entry.detail, null, 2);
+  }
+  return entry.message || entry.error || '';
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -808,12 +924,23 @@ function auditActionLabel(action) {
     host_update: '更新主机',
     host_remove: '删除主机',
     host_connect: '连接主机',
+    host_connect_failed: '连接失败',
+    host_disconnect: '断开主机',
     credential_reveal: '查看凭据',
     exec: '执行命令',
+    exec_failed: '命令失败',
     pty_open: '打开终端',
+    pty_open_failed: '打开终端失败',
+    pty_open_root: '打开 root 终端',
+    pty_open_root_failed: '打开 root 终端失败',
+    pty_send_text: '终端输入',
+    pty_send_key: '终端按键',
     pty_close: '关闭终端',
+    sftp_list: '列出目录',
     sftp_get: '下载文件',
     sftp_put: '上传文件',
+    sftp_download_file: '下载大文件',
+    sftp_upload_file: '上传大文件',
   }[action] || action || '';
 }
 
@@ -869,6 +996,7 @@ function attachEventListeners() {
   document.querySelectorAll('input[name="auth-type"]').forEach((radio) => {
     radio.addEventListener('change', () => syncAuthFields(radio.value));
   });
+  el.hfBecomeRootEnabled().addEventListener('change', syncBecomeRootFields);
 
   // Add host
   el.addHostBtn().addEventListener('click', () => openHostModal(null));

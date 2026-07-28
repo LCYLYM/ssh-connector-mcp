@@ -11,7 +11,7 @@
 //!   master-password-gated reveal returns plaintext.
 
 use crate::error::{ConnectorError, ErrorCode, Result};
-use crate::types::{AuthMethod, HostConfig, HostSpec, JumpHop};
+use crate::types::{AuthMethod, BecomeRootConfig, HostConfig, HostSpec, JumpHop};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -227,6 +227,7 @@ impl Vault {
             auth: spec.auth,
             jump_hosts: spec.jump_hosts,
             env: spec.env,
+            become_root: spec.become_root,
         };
         self.persist_host(&cfg)?;
         Ok(id)
@@ -235,16 +236,17 @@ impl Vault {
     /// Overwrite an existing host wholesale (AI may write new secrets here).
     pub fn update_host(&self, id: &str, spec: HostSpec) -> Result<()> {
         // Ensure it exists.
-        self.get_host_config(id)?;
+        let existing = self.get_host_config(id)?;
         let cfg = HostConfig {
             id: id.to_string(),
             alias: spec.alias,
             host: spec.host,
             port: spec.port,
             user: spec.user,
-            auth: spec.auth,
-            jump_hosts: spec.jump_hosts,
+            auth: merge_auth(existing.auth, spec.auth),
+            jump_hosts: merge_jump_hosts(existing.jump_hosts, spec.jump_hosts),
             env: spec.env,
+            become_root: merge_become_root(existing.become_root, spec.become_root),
         };
         self.persist_host(&cfg)
     }
@@ -343,10 +345,77 @@ impl Vault {
     }
 }
 
+fn merge_auth(existing: AuthMethod, incoming: AuthMethod) -> AuthMethod {
+    match (&existing, &incoming) {
+        (AuthMethod::Password { .. }, AuthMethod::Password { password })
+            if password == "***" || password.is_empty() =>
+        {
+            existing
+        }
+        (
+            AuthMethod::PrivateKey { .. },
+            AuthMethod::PrivateKey {
+                key_pem,
+                passphrase,
+            },
+        ) if key_pem == "***" || key_pem.is_empty() => match (existing, passphrase.as_deref()) {
+            (
+                AuthMethod::PrivateKey {
+                    key_pem,
+                    passphrase: old_passphrase,
+                },
+                Some("***") | None | Some(""),
+            ) => AuthMethod::PrivateKey {
+                key_pem,
+                passphrase: old_passphrase,
+            },
+            (AuthMethod::PrivateKey { key_pem, .. }, Some(new_passphrase)) => {
+                AuthMethod::PrivateKey {
+                    key_pem,
+                    passphrase: Some(new_passphrase.to_string()),
+                }
+            }
+            (other, _) => other,
+        },
+        (AuthMethod::KeyboardInteractive { .. }, AuthMethod::KeyboardInteractive { answers })
+            if answers.is_empty() || answers.iter().all(|a| a == "***") =>
+        {
+            existing
+        }
+        _ => incoming,
+    }
+}
+
+fn merge_jump_hosts(existing: Vec<JumpHop>, incoming: Vec<JumpHop>) -> Vec<JumpHop> {
+    incoming
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut hop)| {
+            if let Some(old) = existing.get(idx) {
+                hop.auth = merge_auth(old.auth.clone(), hop.auth);
+            }
+            hop
+        })
+        .collect()
+}
+
+fn merge_become_root(
+    existing: Option<BecomeRootConfig>,
+    incoming: Option<BecomeRootConfig>,
+) -> Option<BecomeRootConfig> {
+    match (existing, incoming) {
+        (Some(old), Some(mut new)) if new.password == "***" || new.password.is_empty() => {
+            new.password = old.password;
+            Some(new)
+        }
+        (_, new) => new,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AuthMethod;
+    use crate::types::{AuthMethod, BecomeRootConfig};
 
     fn temp_vault() -> Vault {
         let dir =
@@ -392,6 +461,7 @@ mod tests {
             },
             jump_hosts: vec![],
             env: Default::default(),
+            become_root: None,
         };
         let id = v.add_host(spec).unwrap();
         let cfg = v.get_host_config(&id).unwrap();
@@ -418,6 +488,62 @@ mod tests {
     }
 
     #[test]
+    fn update_host_keeps_redacted_secrets_and_become_root_password() {
+        let v = temp_vault();
+        v.init("pw").unwrap();
+        let id = v
+            .add_host(HostSpec {
+                alias: "box1".into(),
+                host: "1.2.3.4".into(),
+                port: 22,
+                user: "ubuntu".into(),
+                auth: AuthMethod::Password {
+                    password: "ssh-secret".into(),
+                },
+                jump_hosts: vec![],
+                env: Default::default(),
+                become_root: Some(BecomeRootConfig {
+                    enabled: true,
+                    command: "su -".into(),
+                    password: "root-secret".into(),
+                    prompt_timeout_ms: 5000,
+                }),
+            })
+            .unwrap();
+
+        v.update_host(
+            &id,
+            HostSpec {
+                alias: "renamed".into(),
+                host: "1.2.3.4".into(),
+                port: 22,
+                user: "ubuntu".into(),
+                auth: AuthMethod::Password {
+                    password: "***".into(),
+                },
+                jump_hosts: vec![],
+                env: Default::default(),
+                become_root: Some(BecomeRootConfig {
+                    enabled: true,
+                    command: "su -".into(),
+                    password: "***".into(),
+                    prompt_timeout_ms: 9000,
+                }),
+            },
+        )
+        .unwrap();
+
+        let cfg = v.get_host_config(&id).unwrap();
+        match cfg.auth {
+            AuthMethod::Password { password } => assert_eq!(password, "ssh-secret"),
+            _ => panic!("wrong auth"),
+        }
+        let become_root = cfg.become_root.unwrap();
+        assert_eq!(become_root.password, "root-secret");
+        assert_eq!(become_root.prompt_timeout_ms, 9000);
+    }
+
+    #[test]
     fn locked_vault_refuses_host_ops() {
         let v = temp_vault();
         v.init("pw").unwrap();
@@ -432,6 +558,7 @@ mod tests {
             },
             jump_hosts: vec![],
             env: Default::default(),
+            become_root: None,
         };
         assert_eq!(v.add_host(spec).unwrap_err().code, ErrorCode::VaultLocked);
     }

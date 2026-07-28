@@ -71,7 +71,7 @@
         <div class="summary-strip" aria-label="能力摘要">
           <div><strong>短命令</strong><span>exec argv 自动转义</span></div>
           <div><strong>长会话</strong><span>PTY 会话可接管和关闭</span></div>
-          <div><strong>文件</strong><span>SFTP 文本传输</span></div>
+          <div><strong>文件</strong><span>SFTP 文本/二进制传输</span></div>
           <div><strong>审计</strong><span>操作流水本地记录</span></div>
         </div>
         <div id="hosts-status" class="status-bar hidden" role="status" aria-live="polite"></div>
@@ -201,6 +201,27 @@
           <legend>跳板主机 <span class="hint">（可选）</span></legend>
           <div id="jump-hosts-list"></div>
           <button type="button" id="add-jump-btn" class="btn btn-ghost btn-sm">+ 添加跳板</button>
+        </fieldset>
+        <fieldset class="field-group" id="become-root-section">
+          <legend>登入后转 root <span class="hint">（可选）</span></legend>
+          <label class="checkbox-row">
+            <input id="hf-become-root-enabled" type="checkbox" />
+            <span>打开 PTY 后自动执行 su 并输入 root 密码</span>
+          </label>
+          <div id="become-root-fields" class="form-grid hidden">
+            <div class="field-group">
+              <label for="hf-become-root-command">提权命令</label>
+              <input id="hf-become-root-command" type="text" value="su -" placeholder="su -" />
+            </div>
+            <div class="field-group">
+              <label for="hf-become-root-password">root 密码</label>
+              <input id="hf-become-root-password" type="password" autocomplete="new-password" placeholder="root 密码" />
+            </div>
+            <div class="field-group">
+              <label for="hf-become-root-timeout">等待密码提示（毫秒）</label>
+              <input id="hf-become-root-timeout" type="number" min="500" max="60000" value="5000" />
+            </div>
+          </div>
         </fieldset>
         <fieldset class="field-group" id="env-vars-section">
           <legend>环境变量 <span class="hint">（可选）</span></legend>

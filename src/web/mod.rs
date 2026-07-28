@@ -33,6 +33,7 @@ pub fn router(state: Shared, static_dir: std::path::PathBuf) -> Router {
         .route("/hosts", get(get_hosts).post(add_host))
         .route("/hosts/{id}", put(update_host).delete(remove_host))
         .route("/hosts/{id}/connect", post(connect_host))
+        .route("/hosts/{id}/disconnect", post(disconnect_host))
         .route("/hosts/{id}/reveal", post(reveal_host))
         .route("/sessions", get(get_sessions))
         .route("/sessions/{id}/close", post(close_session))
@@ -59,9 +60,13 @@ impl IntoResponse for ApiError {
         let status = match self.0.code {
             ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
             ErrorCode::HostNotFound | ErrorCode::SessionNotFound => StatusCode::NOT_FOUND,
-            ErrorCode::VaultLocked | ErrorCode::VaultBadPassword | ErrorCode::AuthFailed => {
-                StatusCode::UNAUTHORIZED
-            }
+            ErrorCode::VaultLocked
+            | ErrorCode::VaultBadPassword
+            | ErrorCode::AuthFailed
+            | ErrorCode::PrivateKeyInvalid
+            | ErrorCode::PrivateKeyPassphraseRequired
+            | ErrorCode::PrivateKeyPassphraseInvalid
+            | ErrorCode::KeyboardInteractiveFailed => StatusCode::UNAUTHORIZED,
             ErrorCode::VaultAlreadyInit | ErrorCode::HostKeyMismatch => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -93,7 +98,9 @@ async fn vault_init(State(st): State<Shared>, Json(req): Json<MasterPassword>) -
     st.vault
         .init(&req.master_password)
         .map_err(ApiError::from)?;
-    st.audit.record(crate::audit::AuditLog::entry("vault_init"));
+    st.audit.record(
+        crate::audit::AuditLog::entry("vault_init").with_detail(json!({ "source": "web" })),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -101,15 +108,16 @@ async fn vault_unlock(State(st): State<Shared>, Json(req): Json<MasterPassword>)
     st.vault
         .unlock(&req.master_password)
         .map_err(ApiError::from)?;
-    st.audit
-        .record(crate::audit::AuditLog::entry("vault_unlock"));
+    st.audit.record(
+        crate::audit::AuditLog::entry("vault_unlock").with_detail(json!({ "source": "web" })),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
 // --- Hosts ---
 
 async fn get_hosts(State(st): State<Shared>) -> ApiResult {
-    let hosts = st.list_hosts().await.map_err(ApiError::from)?;
+    let hosts = st.list_host_details().await.map_err(ApiError::from)?;
     Ok(Json(json!({ "hosts": hosts })))
 }
 
@@ -137,6 +145,11 @@ async fn connect_host(State(st): State<Shared>, Path(id): Path<String>) -> ApiRe
     Ok(Json(json!({ "status": "connected" })))
 }
 
+async fn disconnect_host(State(st): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    st.disconnect_host(&id).await.map_err(ApiError::from)?;
+    Ok(Json(json!({ "status": "disconnected" })))
+}
+
 async fn reveal_host(
     State(st): State<Shared>,
     Path(id): Path<String>,
@@ -147,8 +160,11 @@ async fn reveal_host(
         .vault
         .reveal_credentials(&id, &req.master_password)
         .map_err(ApiError::from)?;
-    st.audit
-        .record(crate::audit::AuditLog::entry("credential_reveal").with_host(&id));
+    st.audit.record(
+        crate::audit::AuditLog::entry("credential_reveal")
+            .with_host(&id)
+            .with_detail(json!({ "source": "web" })),
+    );
     Ok(Json(json!({ "auth": auth, "jump_hosts": jumps })))
 }
 

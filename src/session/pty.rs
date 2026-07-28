@@ -235,17 +235,39 @@ async fn feed(state: &Arc<Mutex<PtyState>>, raw_tx: &broadcast::Sender<Vec<u8>>,
         Err(_) => (String::from_utf8_lossy(data).into_owned(), true),
     };
     st.text_tail.push_str(&chunk);
-    if st.text_tail.len() > TEXT_TAIL_CAP {
-        let cut = st.text_tail.len() - TEXT_TAIL_CAP;
-        st.text_tail.drain(..cut);
-    }
+    trim_text_tail(&mut st.text_tail);
     st.last_activity = Instant::now();
     // Best-effort broadcast to any Web-UI subscribers.
     let _ = raw_tx.send(data.to_vec());
+}
+
+fn trim_text_tail(text: &mut String) {
+    if text.len() <= TEXT_TAIL_CAP {
+        return;
+    }
+    let mut cut = text.len() - TEXT_TAIL_CAP;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text.drain(..cut);
 }
 
 fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trims_multibyte_text_on_utf8_boundary() {
+        let mut text = format!("prefix{}suffix", "中".repeat(TEXT_TAIL_CAP));
+        trim_text_tail(&mut text);
+        assert!(text.len() <= TEXT_TAIL_CAP);
+        assert!(text.ends_with("suffix"));
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+    }
 }

@@ -54,6 +54,9 @@ impl client::Handler for ClientHandler {
 
 fn client_config(keepalive_secs: u64) -> Arc<client::Config> {
     let mut cfg = client::Config::default();
+    // SFTP and interactive sessions exchange many small request/response
+    // packets. Avoid delayed TCP writes on high-latency links.
+    cfg.nodelay = true;
     if keepalive_secs > 0 {
         cfg.keepalive_interval = Some(std::time::Duration::from_secs(keepalive_secs));
     }
@@ -62,17 +65,24 @@ fn client_config(keepalive_secs: u64) -> Arc<client::Config> {
 
 /// Parse a private key from PEM, decrypting with the passphrase if needed.
 fn load_private_key(key_pem: &str, passphrase: Option<&str>) -> Result<PrivateKey> {
-    let key = PrivateKey::from_openssh(key_pem)
-        .map_err(|e| ConnectorError::new(ErrorCode::AuthFailed, format!("bad private key: {e}")))?;
+    let key = PrivateKey::from_openssh(key_pem).map_err(|e| {
+        ConnectorError::new(
+            ErrorCode::PrivateKeyInvalid,
+            format!("private key could not be parsed: {e}"),
+        )
+    })?;
     if key.is_encrypted() {
         let pass = passphrase.ok_or_else(|| {
             ConnectorError::new(
-                ErrorCode::AuthFailed,
+                ErrorCode::PrivateKeyPassphraseRequired,
                 "private key is encrypted but no passphrase given",
             )
         })?;
         key.decrypt(pass).map_err(|e| {
-            ConnectorError::new(ErrorCode::AuthFailed, format!("wrong passphrase: {e}"))
+            ConnectorError::new(
+                ErrorCode::PrivateKeyPassphraseInvalid,
+                format!("private key passphrase was rejected: {e}"),
+            )
         })
     } else {
         Ok(key)
@@ -88,7 +98,8 @@ async fn authenticate(
     let ok = match auth {
         AuthMethod::Password { password } => handle
             .authenticate_password(user, password)
-            .await?
+            .await
+            .map_err(|e| auth_exchange_error("password", user, e))?
             .success(),
         AuthMethod::PrivateKey {
             key_pem,
@@ -97,7 +108,11 @@ async fn authenticate(
             let key = load_private_key(key_pem, passphrase.as_deref())?;
             // Prefer SHA-256 for RSA; ignored for other key types.
             let kwh = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-            handle.authenticate_publickey(user, kwh).await?.success()
+            handle
+                .authenticate_publickey(user, kwh)
+                .await
+                .map_err(|e| auth_exchange_error("private_key", user, e))?
+                .success()
         }
         AuthMethod::KeyboardInteractive { answers } => {
             authenticate_keyboard_interactive(handle, user, answers).await?
@@ -106,11 +121,31 @@ async fn authenticate(
     if ok {
         Ok(())
     } else {
+        let code = match auth {
+            AuthMethod::KeyboardInteractive { .. } => ErrorCode::KeyboardInteractiveFailed,
+            _ => ErrorCode::AuthFailed,
+        };
         Err(ConnectorError::new(
-            ErrorCode::AuthFailed,
+            code,
             format!("authentication failed for user {user}"),
         ))
     }
+}
+
+fn auth_exchange_error(
+    auth_kind: &str,
+    user: &str,
+    error: impl std::fmt::Display,
+) -> ConnectorError {
+    let code = if auth_kind == "keyboard_interactive" {
+        ErrorCode::KeyboardInteractiveFailed
+    } else {
+        ErrorCode::AuthFailed
+    };
+    ConnectorError::new(
+        code,
+        format!("{auth_kind} authentication exchange failed for user {user}: {error}"),
+    )
 }
 
 async fn authenticate_keyboard_interactive(
@@ -120,7 +155,8 @@ async fn authenticate_keyboard_interactive(
 ) -> Result<bool> {
     let mut resp = handle
         .authenticate_keyboard_interactive_start(user, None)
-        .await?;
+        .await
+        .map_err(|e| auth_exchange_error("keyboard_interactive", user, e))?;
     let mut idx = 0usize;
     loop {
         match resp {
@@ -136,7 +172,8 @@ async fn authenticate_keyboard_interactive(
                 }
                 resp = handle
                     .authenticate_keyboard_interactive_respond(replies)
-                    .await?;
+                    .await
+                    .map_err(|e| auth_exchange_error("keyboard_interactive", user, e))?;
             }
         }
     }
@@ -182,23 +219,34 @@ async fn establish(
         host: first_host.to_string(),
         port: first_port,
     };
+    let jump_count = cfg.jump_hosts.len();
     let mut handle = client::connect(
         client_config(keepalive_secs),
         (first_host, first_port),
         handler,
     )
     .await
-    .map_err(|e| map_hop_error(0, first_host, e.into()))?;
+    .map_err(|e| {
+        map_chain_error(
+            0,
+            jump_count,
+            first_host,
+            first_port,
+            classify_connect_error(e.into()),
+        )
+    })?;
     authenticate(&mut handle, first_user, first_auth)
         .await
-        .map_err(|e| map_hop_error(0, first_host, e))?;
+        .map_err(|e| map_chain_error(0, jump_count, first_host, first_port, e))?;
 
     // Subsequent hops: tunnel through the previous handle.
     for (i, &(host, port, user, auth)) in chain.iter().enumerate().skip(1) {
         let channel = handle
             .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
             .await
-            .map_err(|e| map_hop_error(i, host, e.into()))?;
+            .map_err(|e| {
+                map_chain_error(i, jump_count, host, port, classify_connect_error(e.into()))
+            })?;
         let handler = ClientHandler {
             vault: vault.clone(),
             host: host.to_string(),
@@ -210,32 +258,86 @@ async fn establish(
             handler,
         )
         .await
-        .map_err(|e| map_hop_error(i, host, e))?;
+        .map_err(|e| map_chain_error(i, jump_count, host, port, classify_connect_error(e)))?;
         authenticate(&mut next, user, auth)
             .await
-            .map_err(|e| map_hop_error(i, host, e))?;
+            .map_err(|e| map_chain_error(i, jump_count, host, port, e))?;
         handle = next;
     }
 
     Ok(handle)
 }
 
-fn map_hop_error(hop_index: usize, host: &str, e: ConnectorError) -> ConnectorError {
-    // Final hop keeps its native code (auth_failed/host_key_mismatch); intermediate
-    // hops are wrapped as jump_failed_at_hop with the index.
-    let ctx = serde_json::json!({ "hop_index": hop_index, "host": host });
-    if hop_index == 0 {
-        // Could be the only hop (no jumps) — keep specific code if it's auth/hostkey.
-        match e.code {
-            ErrorCode::AuthFailed | ErrorCode::HostKeyMismatch => e.with_context(ctx),
-            _ => e.with_context(ctx),
-        }
-    } else {
+fn classify_connect_error(error: ConnectorError) -> ConnectorError {
+    match error.code {
+        ErrorCode::HostKeyMismatch => error,
+        ErrorCode::Internal => ConnectorError::new(ErrorCode::SshConnectFailed, error.message),
+        _ => error,
+    }
+}
+
+fn map_chain_error(
+    hop_index: usize,
+    jump_count: usize,
+    host: &str,
+    port: u16,
+    error: ConnectorError,
+) -> ConnectorError {
+    let cause_code = error.code.as_str();
+    let is_jump = hop_index < jump_count;
+    let ctx = serde_json::json!({
+        "hop_index": hop_index,
+        "host": host,
+        "port": port,
+        "stage": if is_jump { "jump_host" } else { "final_target" },
+        "cause_code": cause_code,
+    });
+    if is_jump {
         ConnectorError::new(
             ErrorCode::JumpFailedAtHop,
-            format!("jump hop {hop_index} ({host}) failed: {e}"),
+            format!("jump hop {hop_index} ({host}:{port}) failed: {error}"),
         )
         .with_context(ctx)
+    } else {
+        error.with_context(ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_private_key_has_specific_code() {
+        let error = load_private_key("not-a-private-key", None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::PrivateKeyInvalid);
+    }
+
+    #[test]
+    fn first_jump_failure_is_not_misclassified_as_final_target() {
+        let error = map_chain_error(
+            0,
+            1,
+            "jump.example",
+            22,
+            ConnectorError::new(ErrorCode::AuthFailed, "rejected"),
+        );
+        assert_eq!(error.code, ErrorCode::JumpFailedAtHop);
+        assert_eq!(error.context.as_ref().unwrap()["cause_code"], "auth_failed");
+        assert_eq!(error.context.as_ref().unwrap()["stage"], "jump_host");
+    }
+
+    #[test]
+    fn final_target_preserves_root_cause_after_jump() {
+        let error = map_chain_error(
+            1,
+            1,
+            "target.example",
+            22,
+            ConnectorError::new(ErrorCode::HostKeyMismatch, "changed"),
+        );
+        assert_eq!(error.code, ErrorCode::HostKeyMismatch);
+        assert_eq!(error.context.as_ref().unwrap()["stage"], "final_target");
     }
 }
 
